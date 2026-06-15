@@ -3,6 +3,7 @@ package logstore
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1647,4 +1648,113 @@ func TestHybridMigrationInProgressForwardsToInner(t *testing.T) {
 	assert.True(t, gated.MigrationInProgress(context.Background()))
 
 	var _ MaintenanceGate = hybrid
+}
+
+// TestHybrid_BatchUpdateKeepsDBRowContentFree covers a reconcile onto a row that
+// has no stored object yet (its partial insert never offloaded anything): the
+// scalar columns land on the DB row, the output is offloaded like an insert's
+// would be, and the DB row never holds content, visible or hidden.
+func TestHybrid_BatchUpdateKeepsDBRowContentFree(t *testing.T) {
+	hybrid, inner, _ := newTestHybrid(t)
+	defer hybrid.Close(context.Background())
+	ctx := context.Background()
+	ts := time.Now().UTC()
+
+	for _, id := range []string{"visible", "hidden"} {
+		require.NoError(t, inner.CreateIfNotExists(ctx, &Log{
+			ID: id, Timestamp: ts, CreatedAt: ts, Object: "chat.completion", Provider: "openai", Model: "gpt-4o",
+			Status: "processing", ContentHidden: id == "hidden",
+		}))
+	}
+
+	output := "reconciled output"
+	msg := func() *schemas.ChatMessage {
+		return &schemas.ChatMessage{Role: schemas.ChatMessageRoleAssistant, Content: &schemas.ChatMessageContent{ContentStr: &output}}
+	}
+	require.NoError(t, hybrid.BatchUpdate(ctx, []*Log{
+		{ID: "visible", Status: "success", TotalTokens: 7, OutputMessageParsed: msg()},
+		{ID: "hidden", Status: "success", TotalTokens: 9, OutputMessageParsed: msg(), ContentHidden: true},
+		{ID: "absent", Status: "success"}, // skipped, never inserted
+	}))
+	waitForOffload(t, inner, "visible")
+	waitForOffload(t, inner, "hidden")
+
+	visibleRow, err := inner.FindByID(ctx, "visible")
+	require.NoError(t, err)
+	assert.Equal(t, "success", visibleRow.Status)
+	assert.Equal(t, 7, visibleRow.TotalTokens)
+	assert.Empty(t, visibleRow.OutputMessage, "visible reconcile offloads its output instead of writing it to the DB row")
+	visible, err := hybrid.FindByID(ctx, "visible")
+	require.NoError(t, err)
+	assert.Contains(t, visible.OutputMessage, output, "visible row hydrates the reconciled output")
+
+	hiddenRow, err := inner.FindByID(ctx, "hidden")
+	require.NoError(t, err)
+	assert.Equal(t, "success", hiddenRow.Status)
+	assert.Equal(t, 9, hiddenRow.TotalTokens)
+	assert.Empty(t, hiddenRow.OutputMessage, "hidden reconcile must not write content into the DB row")
+	assert.True(t, hiddenRow.ContentHidden)
+
+	_, err = inner.FindByID(ctx, "absent")
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+// TestHybrid_BatchUpdateMergesOutputIntoStoredObject covers the reconcile of a
+// request that completed after its pending entry was evicted: the partial row's
+// input is already in object storage, so the late output must be merged into
+// that object (for hidden and visible rows alike) while the DB row stays
+// content-free, exactly as an insert would have left it.
+func TestHybrid_BatchUpdateMergesOutputIntoStoredObject(t *testing.T) {
+	hybrid, inner, objStore := newTestHybrid(t)
+	defer hybrid.Close(context.Background())
+	ctx := context.Background()
+	ts := time.Now().UTC()
+
+	input := "the question"
+	for _, id := range []string{"merge-visible", "merge-hidden"} {
+		entry := &Log{
+			ID: id, Timestamp: ts, CreatedAt: ts, Object: "chat.completion", Provider: "openai", Model: "gpt-4o",
+			Status: "processing", ContentHidden: id == "merge-hidden",
+			InputHistoryParsed: []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: &input}}},
+		}
+		require.NoError(t, hybrid.CreateIfNotExists(ctx, entry))
+		waitForOffload(t, inner, id)
+	}
+
+	output := "the answer"
+	msg := func() *schemas.ChatMessage {
+		return &schemas.ChatMessage{Role: schemas.ChatMessageRoleAssistant, Content: &schemas.ChatMessageContent{ContentStr: &output}}
+	}
+	require.NoError(t, hybrid.BatchUpdate(ctx, []*Log{
+		{ID: "merge-visible", Status: "success", TotalTokens: 7, OutputMessageParsed: msg()},
+		{ID: "merge-hidden", Status: "success", TotalTokens: 9, OutputMessageParsed: msg(), ContentHidden: true},
+	}))
+
+	for _, id := range []string{"merge-visible", "merge-hidden"} {
+		waitForUploads(t, func() bool {
+			data, err := objStore.Get(ctx, ObjectKey("test", ts, id))
+			return err == nil && strings.Contains(string(data), output)
+		})
+		data, err := objStore.Get(ctx, ObjectKey("test", ts, id))
+		require.NoError(t, err)
+		assert.Contains(t, string(data), input, "%s: stored object keeps the input", id)
+		assert.Contains(t, string(data), output, "%s: stored object gains the late output", id)
+
+		dbRow, err := inner.FindByID(ctx, id)
+		require.NoError(t, err)
+		assert.Equal(t, "success", dbRow.Status)
+		assert.Empty(t, dbRow.OutputMessage, "%s: DB row stays content-free", id)
+	}
+
+	visible, err := hybrid.FindByID(ctx, "merge-visible")
+	require.NoError(t, err)
+	assert.Equal(t, 7, visible.TotalTokens)
+	assert.Contains(t, visible.InputHistory, input)
+	assert.Contains(t, visible.OutputMessage, output, "visible row hydrates input and output")
+
+	hidden, err := hybrid.FindByID(ctx, "merge-hidden")
+	require.NoError(t, err)
+	assert.Equal(t, 9, hidden.TotalTokens)
+	assert.True(t, hidden.ContentHidden)
+	assert.Empty(t, hidden.OutputMessage, "hidden row never hydrates content")
 }

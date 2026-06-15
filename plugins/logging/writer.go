@@ -2,6 +2,7 @@ package logging
 
 import (
 	"context"
+	"hash/fnv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -66,6 +67,17 @@ type PendingLogData struct {
 	LastActivity atomic.Int64
 	// Live is set for a GPT Live session's row: what its units have folded into it so far.
 	Live *liveSessionState
+	// ProvisionalInput marks input captured before the virtual key's content decision
+	// was known; eviction never persists it, since the final-policy drop cannot run.
+	ProvisionalInput bool
+	// ContentPolicy is the content policy resolved for the request in PreLLMHook.
+	// Eviction has no request context, so it applies this instead of the global
+	// policy; nil falls back to the global policy.
+	ContentPolicy *contentPolicy
+	// EvictedPartial marks a stub built by PostLLMHook for a request whose pending
+	// entry was already evicted: the completed entry reconciles onto the partial row
+	// persisted at eviction (UPDATE) instead of being inserted.
+	EvictedPartial bool
 }
 
 // pendingInjectEntries wraps a slice of log entries so it can be used with sync.Map.
@@ -93,8 +105,10 @@ type pendingAgentInjectEntries struct {
 }
 
 // writeQueueEntry is an entry pushed to the batch write queue.
+// Exactly one of log (insert), logUpdate (partial update), mcpLog or agentLog is set.
 type writeQueueEntry struct {
 	log         *logstore.Log
+	logUpdate   *logstore.Log
 	mcpLog      *logstore.MCPToolLog
 	agentLog    *logstore.AgentLog
 	callback    func(entry *logstore.Log)
@@ -435,6 +449,22 @@ func (p *LoggerPlugin) insertAgentLogIndividually(ctx context.Context, log *logs
 	return true
 }
 
+// updateLogIndividually is the per-row fallback for a partial log update whose
+// batch failed with a row-level error. It reports false when ctx ended before
+// the row was written or dropped.
+func (p *LoggerPlugin) updateLogIndividually(ctx context.Context, log *logstore.Log) bool {
+	err := p.store.BatchUpdate(ctx, []*logstore.Log{log})
+	if err == nil {
+		return true
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	p.logger.Warn("individual update failed for log %s: %v", log.ID, err)
+	p.droppedRequests.Add(1)
+	return true
+}
+
 // processBatch writes a batch of log entries, chunked by the store, and
 // recovers from failures per writeWithRecovery. ctx bounds the store calls,
 // retries and splitting. It returns the entries that were not written because
@@ -444,13 +474,17 @@ func (p *LoggerPlugin) processBatch(ctx context.Context, batch []*writeQueueEntr
 		return nil
 	}
 
-	// Collect all log entries for batch insert
+	// Collect all log entries, separating inserts from partial updates
 	logs := make([]*logstore.Log, 0, len(batch))
+	logUpdates := make([]*logstore.Log, 0, len(batch))
 	mcpLogs := make([]*logstore.MCPToolLog, 0, len(batch))
 	agentLogs := make([]*logstore.AgentLog, 0, len(batch))
 	for _, entry := range batch {
 		if entry.log != nil {
 			logs = append(logs, entry.log)
+		}
+		if entry.logUpdate != nil {
+			logUpdates = append(logUpdates, entry.logUpdate)
 		}
 		if entry.mcpLog != nil {
 			mcpLogs = append(mcpLogs, entry.mcpLog)
@@ -470,16 +504,27 @@ func (p *LoggerPlugin) processBatch(ctx context.Context, batch []*writeQueueEntr
 		_, err := p.store.BatchCreateAgentLogsIfNotExists(ctx, chunk)
 		return err
 	}, p.insertAgentLogIndividually)
+	// Updates run after the inserts so a partial-row insert and its reconciling
+	// update landing in the same batch resolve correctly: the row exists by the
+	// time the update runs. The queue is FIFO and the insert is always enqueued
+	// first (at eviction), so it is never in a later batch than its update.
+	unwrittenUpdates := writeWithRecovery(p, ctx, "log update", logUpdates, func(ctx context.Context, chunk []*logstore.Log) error {
+		return p.store.BatchUpdate(ctx, chunk)
+	}, p.updateLogIndividually)
 
 	// Map unwritten rows back to their queue entries. An entry carrying more
 	// than one log type is handed back whole if any part is unwritten; persisted
 	// parts are re-inserted as no-ops by conflict-safe insertion.
 	var unwritten []*writeQueueEntry
-	skip := make(map[*writeQueueEntry]struct{}, len(unwrittenLogs)+len(unwrittenMCP)+len(unwrittenAgent))
-	if len(unwrittenLogs) > 0 || len(unwrittenMCP) > 0 || len(unwrittenAgent) > 0 {
-		pending := make(map[any]struct{}, len(unwrittenLogs)+len(unwrittenMCP)+len(unwrittenAgent))
+	unwrittenCount := len(unwrittenLogs) + len(unwrittenUpdates) + len(unwrittenMCP) + len(unwrittenAgent)
+	skip := make(map[*writeQueueEntry]struct{}, unwrittenCount)
+	if unwrittenCount > 0 {
+		pending := make(map[any]struct{}, unwrittenCount)
 		for _, l := range unwrittenLogs {
 			pending[l] = struct{}{}
+		}
+		for _, u := range unwrittenUpdates {
+			pending[u] = struct{}{}
 		}
 		for _, m := range unwrittenMCP {
 			pending[m] = struct{}{}
@@ -489,9 +534,10 @@ func (p *LoggerPlugin) processBatch(ctx context.Context, batch []*writeQueueEntr
 		}
 		for _, entry := range batch {
 			_, logPending := pending[entry.log]
+			_, updatePending := pending[entry.logUpdate]
 			_, mcpPending := pending[entry.mcpLog]
 			_, agentPending := pending[entry.agentLog]
-			if (entry.log != nil && logPending) || (entry.mcpLog != nil && mcpPending) || (entry.agentLog != nil && agentPending) {
+			if (entry.log != nil && logPending) || (entry.logUpdate != nil && updatePending) || (entry.mcpLog != nil && mcpPending) || (entry.agentLog != nil && agentPending) {
 				skip[entry] = struct{}{}
 				unwritten = append(unwritten, entry)
 			}
@@ -523,7 +569,12 @@ func (p *LoggerPlugin) processBatch(ctx context.Context, batch []*writeQueueEntr
 			continue
 		}
 		if entry.callback != nil {
-			callbacks = append(callbacks, cbPair{cb: entry.callback, log: entry.log})
+			// Insert entries carry log; update entries carry logUpdate.
+			cbLog := entry.log
+			if cbLog == nil {
+				cbLog = entry.logUpdate
+			}
+			callbacks = append(callbacks, cbPair{cb: entry.callback, log: cbLog})
 		}
 		if entry.mcpCallback != nil {
 			mcpCallbacks = append(mcpCallbacks, mcpCbPair{cb: entry.mcpCallback, log: entry.mcpLog})
@@ -548,9 +599,12 @@ func (p *LoggerPlugin) processBatch(ctx context.Context, batch []*writeQueueEntr
 }
 
 // cleanupStalePendingLogs removes stale in-memory pending log state.
-// Pending LLM entries are dropped to prevent unbounded memory growth. Pending
-// MCP entries are converted into terminal error rows and queued for persistence,
-// because PreMCPHook does not write a processing row to the database.
+// Before a stale LLM entry is dropped, its input is persisted as a partial
+// "processing" row so a request that finishes late can still be reconciled
+// onto it (see the evicted-partial path in PostLLMHook) instead of losing its
+// log entirely. Pending MCP entries are converted into terminal error rows and
+// queued for persistence, because PreMCPHook does not write a processing row
+// to the database.
 func (p *LoggerPlugin) cleanupStalePendingLogs() {
 	cutoff := time.Now().Add(-pendingLogTTL)
 	p.pendingLogsEntries.Range(func(key, value any) bool {
@@ -564,7 +618,9 @@ func (p *LoggerPlugin) cleanupStalePendingLogs() {
 				lastActive = time.Unix(0, nanos)
 			}
 			if lastActive.Before(cutoff) {
-				p.pendingLogsEntries.Delete(key)
+				// persistEvictedPartial claims the entry itself; a claim that fails
+				// means PostLLMHook took it first and will write the full row.
+				p.persistEvictedPartial(key, pending)
 			}
 		}
 		return true
@@ -607,6 +663,84 @@ func (p *LoggerPlugin) cleanupStalePendingLogs() {
 		}
 		return true
 	})
+	// Drop evicted-partial markers whose request never finished. A later finish
+	// still finds the row through the DB probe while flushStaleProcessingLogs
+	// has not reaped it yet.
+	p.evictedPartials.Range(func(key, value any) bool {
+		if ts, ok := value.(time.Time); ok && ts.Before(cutoff) {
+			p.evictedPartials.Delete(key)
+		}
+		return true
+	})
+}
+
+// pendingClaimShards is the number of locks pendingClaimLock stripes request
+// IDs over. Only eviction and terminal PostLLMHook calls take these locks, so
+// contention is negligible; the stripe count just bounds memory.
+const pendingClaimShards = 64
+
+// pendingClaimLock returns the lock that serializes who takes a request's
+// pending entry: the stale sweep (which then queues a partial row and a
+// marker) or the terminal PostLLMHook (which then reads the marker). Without
+// it the two can interleave so that the partial row lands after the completed
+// insert, or the marker is read before the partial is queued.
+func (p *LoggerPlugin) pendingClaimLock(requestID string) *sync.Mutex {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(requestID))
+	return &p.pendingClaimLocks[h.Sum32()%pendingClaimShards]
+}
+
+// persistEvictedPartial claims a stale pending entry and, when the claim
+// succeeds, queues a partial "processing" row for it and records the eviction
+// so a late finish can reconcile onto the row with an UPDATE. The claim is a
+// LoadAndDelete under the request's claim lock: if PostLLMHook took the entry
+// first nothing is written, since the completion will insert the full row.
+// The marker is set only when the partial insert was actually queued; a
+// dropped insert leaves no marker, so a later finish still takes the ordinary
+// no-pending path instead of updating a row that does not exist. Content
+// follows the policy resolved for the request in PreLLMHook (global policy
+// when none was recorded), and provisionally captured input is never kept.
+// CreatedAt is reset to now so flushStaleProcessingLogs gives the row a fresh
+// window; Timestamp keeps the original request time. No callback: PreLLMHook
+// already announced the processing entry to subscribers.
+func (p *LoggerPlugin) persistEvictedPartial(key any, pending *PendingLogData) {
+	id, ok := key.(string)
+	if !ok {
+		p.pendingLogsEntries.Delete(key)
+		return
+	}
+	lock := p.pendingClaimLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	if _, claimed := p.pendingLogsEntries.LoadAndDelete(key); !claimed {
+		return
+	}
+	if pending.Live != nil {
+		// A GPT Live session's units are folded in by postLiveUnit, which runs before
+		// the reconcile path, so a partial row could never be reconciled; it would
+		// only sit in "processing" until the stale-row reaper removes it.
+		return
+	}
+	// Every captured input kind, not just chat history: a late speech, image or
+	// video completion has nothing else to recover its input from.
+	partial := buildCompleteLogEntryFromPending(pending)
+	partial.Status = logStatusProcessing
+	partial.CreatedAt = time.Now().UTC()
+	policy := p.resolveContentPolicy(nil)
+	if pending.ContentPolicy != nil {
+		policy = *pending.ContentPolicy
+	}
+	if pending.ProvisionalInput || !policy.storeContent {
+		dropCapturedInput(partial)
+	}
+	partial.ContentHidden = !policy.visible()
+	if !p.enqueueLogEntry(partial, nil) {
+		return
+	}
+	// Queued before the marker is visible, so a finish that sees the marker
+	// enqueues its update behind the insert; processBatch also applies inserts
+	// before updates within a batch.
+	p.evictedPartials.Store(id, time.Now())
 }
 
 // claimStaleMCPEntry takes a pending MCP entry away from PostMCPHook for the stale-entry reaper.
@@ -627,26 +761,28 @@ func (p *LoggerPlugin) claimStaleMCPEntry(key any) (*logstore.MCPToolLog, bool) 
 	return entry, true
 }
 
-// enqueueLogEntry pushes a complete log entry to the write queue.
-// If the queue is full, the entry is dropped to prevent Postgres slowness
-// from cascading into request handling goroutines.
-func (p *LoggerPlugin) enqueueLogEntry(entry *logstore.Log, callback func(entry *logstore.Log)) {
+// enqueueLogEntry pushes a complete log entry to the write queue and reports
+// whether it was queued. If the queue is full, the entry is dropped to prevent
+// Postgres slowness from cascading into request handling goroutines.
+func (p *LoggerPlugin) enqueueLogEntry(entry *logstore.Log, callback func(entry *logstore.Log)) (queued bool) {
 	if p.closed.Load() {
-		return
+		return false
 	}
 	defer func() {
 		if r := recover(); r != nil {
 			p.logger.Error("recovered from a panic %v. dropping log request", r)
 			// Channel was closed between the check and send; entry is dropped
 			p.droppedRequests.Add(1)
+			queued = false
 		}
 	}()
 	select {
 	case p.writeQueue <- &writeQueueEntry{log: entry, callback: callback}:
-		// enqueued successfully
+		return true
 	default:
 		p.countDrop()
 		p.logger.Warn("log write queue full, dropping log entry %s", entry.ID)
+		return false
 	}
 }
 
@@ -654,6 +790,31 @@ func (p *LoggerPlugin) enqueueLogEntry(entry *logstore.Log, callback func(entry 
 // normal async write queue.
 func (p *LoggerPlugin) EnqueueLogEntry(entry *logstore.Log) {
 	p.enqueueLogEntry(entry, p.makePostWriteCallback(nil))
+}
+
+// enqueueLogUpdate pushes a partial log update (ID plus the non-zero output
+// fields) to the write queue. The batch writer applies it through
+// store.BatchUpdate after the batch's inserts, so it reconciles an existing row
+// (the partial persisted at eviction) instead of inserting. A full queue drops
+// the update, matching enqueueLogEntry's backpressure.
+func (p *LoggerPlugin) enqueueLogUpdate(entry *logstore.Log, callback func(entry *logstore.Log)) {
+	if p.closed.Load() {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			p.logger.Error("recovered from a panic %v. dropping log update", r)
+			// Channel was closed between the check and send; entry is dropped
+			p.droppedRequests.Add(1)
+		}
+	}()
+	select {
+	case p.writeQueue <- &writeQueueEntry{logUpdate: entry, callback: callback}:
+		// enqueued successfully
+	default:
+		p.countDrop()
+		p.logger.Warn("log write queue full, dropping log update %s", entry.ID)
+	}
 }
 
 // EnqueueMCPToolLogEntry pushes a completed MCP log through the normal async write queue.
@@ -723,7 +884,10 @@ func estimateWriteQueueEntrySize(entry *writeQueueEntry) int {
 	if entry.mcpLog != nil {
 		return estimateMCPToolLogEntrySize(entry.mcpLog)
 	}
-	return estimateLogEntrySize(entry.log)
+	if entry.log != nil {
+		return estimateLogEntrySize(entry.log)
+	}
+	return estimateLogEntrySize(entry.logUpdate)
 }
 
 // estimateLogEntrySize returns a rough byte-size estimate for a log entry

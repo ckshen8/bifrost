@@ -1105,6 +1105,85 @@ func (h *HybridLogStore) GetDimensionLatencyHistogram(ctx context.Context, filte
 	return h.inner.GetDimensionLatencyHistogram(ctx, filters, bucketSizeSeconds, dimension)
 }
 
+// BatchUpdate reconciles output fields onto existing rows the same way an
+// insert would have placed them: the DB row gets the scalar columns, and the
+// payload goes to object storage. For each entry the current row is read (the
+// update carries no timestamp, which the object key needs), its stored object
+// is merged over it, the entry's own payload is merged on top, and the result
+// is re-uploaded; the DB row stays content-free. Hidden rows are handled
+// identically, which is what keeps a retained response from being lost: the
+// hidden DB row must never hold content, so the object is the only place the
+// late output can go. Rows whose request type is excluded from offloading pass
+// through unchanged, and rows that do not exist are skipped, as in the inner
+// store.
+func (h *HybridLogStore) BatchUpdate(ctx context.Context, entries []*Log) error {
+	type pendingUpload struct {
+		logID     string
+		timestamp time.Time
+		payload   map[string]string
+		tags      map[string]string
+	}
+	var uploads []pendingUpload
+	dbEntries := make([]*Log, 0, len(entries))
+	for _, entry := range entries {
+		if entry == nil || entry.ID == "" {
+			continue
+		}
+		row, err := h.inner.FindByID(ctx, entry.ID)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			return err
+		}
+		hidden := entry.ContentHidden || row.ContentHidden
+		if _, excluded := h.excludedRequestTypes[row.Object]; excluded && !hidden {
+			dbEntries = append(dbEntries, entry)
+			continue
+		}
+		if err := entry.SerializeFields(); err != nil {
+			return fmt.Errorf("logstore: serialize before update: %w", err)
+		}
+		// Rebuild the full payload: what the object already holds, then the
+		// entry's own non-empty fields on top.
+		current := *row
+		current.ContentHidden = hidden
+		if row.HasObject {
+			if data, getErr := h.objects.Get(ctx, ObjectKey(h.prefix, row.Timestamp, row.ID)); getErr != nil {
+				h.logger.Warn("objectstore: failed to fetch payload for log %s before update, merging over the DB row only: %v", row.ID, getErr)
+			} else if mergeErr := MergePayloadFromJSON(&current, data); mergeErr != nil {
+				h.logger.Warn("objectstore: failed to merge payload for log %s before update: %v", row.ID, mergeErr)
+			}
+		}
+		updatePayload, err := sonic.Marshal(ExtractPayload(entry))
+		if err != nil {
+			return fmt.Errorf("logstore: serialize update payload for log %s: %w", entry.ID, err)
+		}
+		if err := MergePayloadFromJSON(&current, updatePayload); err != nil {
+			return err
+		}
+		payload := h.extractUploadPayload(&current)
+		tags := BuildTags(&current)
+		// Shallow copy so the caller's entry is preserved on DB failure.
+		dbEntry := *entry
+		dbEntry.ContentHidden = hidden
+		prepareDBEntry(&dbEntry, h.excludedPayloadFields)
+		h.moveErrorRawBodiesToObject(&dbEntry, payload)
+		dbEntries = append(dbEntries, &dbEntry)
+		uploads = append(uploads, pendingUpload{logID: row.ID, timestamp: row.Timestamp, payload: payload, tags: tags})
+	}
+	if len(dbEntries) == 0 {
+		return nil
+	}
+	if err := h.inner.BatchUpdate(ctx, dbEntries); err != nil {
+		return err
+	}
+	for _, u := range uploads {
+		h.enqueueUpload(u.logID, u.timestamp, u.payload, u.tags)
+	}
+	return nil
+}
+
 // BulkUpdateCost delegates to the inner store and updates the cost columns
 // (total + input/output/additional split) for each (logID -> CostUpdate) pair
 // in a single round trip.
