@@ -12,6 +12,10 @@ import {
 	mergePreviewRows,
 	pruneCredentials,
 	readUploadedSpec,
+	replacePreviewRequest,
+	replacementAutoExecute,
+	isMissingStoredSpec,
+	replacementIsDirty,
 	reconcileToolSelection,
 	securitySchemeToInputs,
 	specFingerprint,
@@ -394,5 +398,53 @@ describe("document and operation servers", () => {
 			"https://staging.example.com",
 		);
 		expect(buildOpenAPIConfigPayload({ spec: "x", base_url: "https://prod.example.com/" }, "paste", reparsed).base_url).toBe("");
+	});
+});
+
+describe("edit sheet replacement helpers", () => {
+	it("counts an open replacement with a parsed preview or edited credentials as dirty", () => {
+		expect(replacementIsDirty({ open: true, preview, credentialsDirty: false })).toBe(true);
+		expect(replacementIsDirty({ open: true, preview: null, credentialsDirty: true })).toBe(true);
+		expect(replacementIsDirty({ open: true, preview: null, credentialsDirty: false, sourceEdited: true })).toBe(true);
+		expect(replacementIsDirty({ open: false, preview: null, credentialsDirty: false, sourceEdited: true })).toBe(false);
+		expect(replacementIsDirty({ open: true, preview: null, credentialsDirty: false })).toBe(false);
+		expect(replacementIsDirty({ open: false, preview, credentialsDirty: true })).toBe(false);
+	});
+	it("keeps auto-execute entries only for selected tools, and '*' only with a full selection", () => {
+		const supported = ["listPets", "createPet", "getPetById"];
+		expect(replacementAutoExecute(["listPets", "createPet"], supported, ["listPets"])).toEqual(["listPets"]);
+		expect(replacementAutoExecute(["*"], supported, ["listPets"])).toEqual([]);
+		expect(replacementAutoExecute(["*"], supported, ["*"])).toEqual(["*"]);
+		expect(replacementAutoExecute(["gone"], supported, ["*"])).toEqual([]);
+	});
+	it("sends the stored include_deprecated with either source", () => {
+		expect(replacePreviewRequest("paste", "doc", "", undefined, true)).toEqual({
+			spec: "doc",
+			base_url: undefined,
+			include_deprecated: true,
+		});
+		expect(replacePreviewRequest("url", "ignored", " https://x/o.json ", "https://b", true)).toEqual({
+			spec_url: "https://x/o.json",
+			base_url: "https://b",
+			include_deprecated: true,
+		});
+		expect(replacePreviewRequest("upload", "doc", "", undefined, undefined)).toEqual({ spec: "doc", base_url: undefined });
+	});
+});
+describe("stored document load", () => {
+	it("treats only a 404 as a client with no stored document", () => {
+		expect(isMissingStoredSpec({ status: 404, data: { error: { message: "This client has no stored spec" } } })).toBe(true);
+		expect(isMissingStoredSpec({ status: 500 })).toBe(false);
+		expect(isMissingStoredSpec({ status: "FETCH_ERROR", error: "TypeError: Failed to fetch" })).toBe(false);
+		expect(isMissingStoredSpec(new Error("boom"))).toBe(false);
+	});
+});
+describe("replace preview naming", () => {
+	it("sends the client name so replaced tool names match what an update accepts", () => {
+		expect(replacePreviewRequest("paste", "doc", "", undefined, false, "petstore")).toEqual({
+			spec: "doc",
+			base_url: undefined,
+			client_name: "petstore",
+		});
 	});
 });
