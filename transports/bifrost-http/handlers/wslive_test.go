@@ -585,3 +585,30 @@ func TestLiveRelayBackendSwitchEnforcesPinnedKeyBeforeForwarding(t *testing.T) {
 	assert.Len(t, posts, len(opens))
 	assert.Equal(t, len(opens), cleanups, "rejected and admitted units are cleaned exactly once")
 }
+
+// panickingLiveModels stands in for a model check that panics, the way a plugin hook on the
+// client pump might.
+type panickingLiveModels struct{}
+
+func (panickingLiveModels) KeySupportsModel(schemas.ModelProvider, schemas.Key, string) bool {
+	panic("model check exploded")
+}
+
+// The client pump runs on its own goroutine, past the recover deferred by the upgrade callback.
+// A panic there ends this session, with the client told and the usage still billed, instead of
+// ending the process.
+func TestLiveRelayEndsSessionWhenClientPumpPanics(t *testing.T) {
+	t.Parallel()
+	f := startLiveRelay(t, panickingLiveModels{}, "gpt-5.6-luna")
+
+	sendFrame(t, f.app, `{"type":"session.update","session":{"delegation":{"type":"responses","responses":{"model":"gpt-5.6-sol"}}}}`)
+	errFrame := readFrame(t, f.app)
+	assert.Contains(t, errFrame, `"type":"error"`)
+	assert.Contains(t, errFrame, "internal error")
+	assert.NotContains(t, errFrame, "exploded", "the panic value is not echoed to the client")
+
+	assert.Equal(t, `{"type":"session.close"}`, readFrame(t, f.openai), "Bifrost ends the session itself")
+	sendFrame(t, f.openai, `{"type":"session.closed","reason":"close_requested","usage":{"seconds":4}}`)
+	f.waitDone(t)
+	assert.Equal(t, []float64{4}, f.voiceSeconds(t), "the usage so far is still billed")
+}

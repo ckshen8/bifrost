@@ -76,6 +76,7 @@ func (h *WSLiveHandler) upgrade(ctx *fasthttp.RequestCtx, up *liveRequest, serve
 	}
 	err := upgrader.Upgrade(ctx, func(conn *ws.Conn) {
 		defer conn.Close()
+		defer recoverWebSocketSession(conn)
 		defer up.cancel()
 		serve(newRealtimeClientConn(conn))
 	})
@@ -295,11 +296,28 @@ func (r *liveWSRelay) run() {
 	clientDone := make(chan struct{})
 	go func() {
 		defer close(clientDone)
+		defer r.recoverPump()
 		r.pumpClient()
 	}()
-	go r.watchStale()
+	go func() {
+		defer r.recoverPump()
+		r.watchStale()
+	}()
 	r.pumpUpstream()
 	releaseLiveClient(r.clientConn, r.clientGone.Load(), clientDone)
+}
+
+// recoverPump is deferred on the goroutines of a live session that run past the recover of the
+// upgrade callback (the client pump, where plugin hooks run, and the stale watcher). A panic
+// there ends this session the way a refusal does, with the client told and the usage spent so
+// far still billed, instead of ending the process. The client sees a fixed message, never the
+// panic value.
+func (r *liveWSRelay) recoverPump() {
+	if rec := recover(); rec != nil {
+		logWebSocketPanic(r.clientConn.conn, rec)
+		r.sendError(newRealtimeWireBifrostError(500, "server_error", "the live session is ending after an internal error"))
+		r.requestClose()
+	}
 }
 
 // releaseLiveClient ends the client side once the upstream is gone. Close on a fasthttp hijacked
@@ -334,6 +352,9 @@ func (r *liveSidebandRelay) run() {
 	clientDone := make(chan struct{})
 	go func() {
 		defer close(clientDone)
+		// pumpClient closes the upstream on the way out, which ends the sideband; a panic
+		// in the update check takes that same exit instead of ending the process.
+		defer recoverWebSocketSession(r.clientConn.conn)
 		r.pumpClient()
 	}()
 	r.pumpUpstream()
