@@ -2022,3 +2022,41 @@ func TestPrometheusHTTPMiddlewarePassesThroughWithoutThePlugin(t *testing.T) {
 		t.Error("request was not served when no telemetry plugin is loaded")
 	}
 }
+
+// TestGovernanceInMemoryStoreProvidersSurviveEdits pins that the provider map the governance
+// plugin reads (batchBaseProvider, modelMatcher) can be indexed after the accessor has released
+// its lock while a provider edit writes to the live map: the accessor must hand back a copy, not
+// the map itself, or the read is a fatal concurrent map access under load.
+func TestGovernanceInMemoryStoreProvidersSurviveEdits(t *testing.T) {
+	t.Parallel()
+	config := &lib.Config{Providers: map[schemas.ModelProvider]configstore.ProviderConfig{schemas.OpenAI: {}}}
+	store := &GovernanceInMemoryStore{Config: config}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 2000; i++ {
+			providers := store.GetConfiguredProviders()
+			_, _ = providers[schemas.OpenAI]
+			_, _ = providers[schemas.Anthropic]
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 2000; i++ {
+			config.Mu.Lock()
+			config.Providers[schemas.Anthropic] = configstore.ProviderConfig{}
+			delete(config.Providers, schemas.Anthropic)
+			config.Mu.Unlock()
+		}
+	}()
+	wg.Wait()
+
+	providers := store.GetConfiguredProviders()
+	config.Mu.Lock()
+	config.Providers[schemas.Gemini] = configstore.ProviderConfig{}
+	config.Mu.Unlock()
+	_, leaked := providers[schemas.Gemini]
+	assert.False(t, leaked, "the returned map is a snapshot, not the live map")
+}
