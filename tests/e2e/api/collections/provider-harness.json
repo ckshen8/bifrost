@@ -247644,6 +247644,7 @@
       ]
     },
     {
+<<<<<<< HEAD
       "name": "199. WebRTC event filter preserves billing (OpenAI local fixture)",
       "description": "Start node tests/e2e/api/runners/provider-error-fixture.mjs on 127.0.0.1:8791 and a gateway. Run FEATURE=\"WebRTC event filter\" INCLUDE_PREVIEW=1. Each case creates and removes a unique OpenAI custom provider pointing only at the local fixture. The fixture rejects requests missing controller events or altering browser command permissions. A deliberately invalid upstream SDP produces the expected 502 only after those checks pass. Pins restricted status-only, empty and nested response selectors on /v1/live/sessions and the OpenAI integration route. Actual billing, sideband fan-out and browser event privacy are covered by tests/live/TestBilling_WebRTCFilteredEvents. No paid provider APIs are used.",
       "item": [
@@ -247681,10 +247682,20 @@
               }
             },
             {
+=======
+      "name": "207. MCP OAuth server on localhost follows the private allowlist (mcp-oauth-private-allowlist)",
+      "description": "Management-endpoint checks with no live provider involved. The MCP OAuth chain (discovery, dynamic client registration, token requests) dials through a public-only guard, so an OAuth-protected MCP server on localhost could not be added by anyone, not even an authenticated admin. Hosts on mcp_oauth_private_allowlist (config.json mcp.tool_manager_config.oauth_private_allowlist) are now reachable for MCP clients registered by an authenticated caller; link-local and metadata addresses stay blocked and clients registered with auth bypassed stay public-only. The harness profile allowlists localhost, 127.0.0.1 and ::1, and every row carries the setup token, so these rows run as an authenticated caller.\n\nPrerequisite: examples/mcps/oauth-demo-server listening on localhost:3003 (cd examples/mcps/oauth-demo-server && go run .). The first row reads the allowlist back from the store; the second registers an OAuth MCP client against the demo server and expects the pending_oauth response carrying the demo server's authorize URL. The consent is never completed, so no MCP client row is created; the pending OAuth config it leaves behind is inert.",
+      "item": [
+        {
+          "name": "GET /api/config · mcp_oauth_private_allowlist from config.json reaches the store",
+          "event": [
+            {
+>>>>>>> f9a2d8dfe (adds allow localhost oauth servers for mcp)
               "listen": "test",
               "script": {
                 "type": "text/javascript",
                 "exec": [
+<<<<<<< HEAD
                   "pm.test('Upstream accounting selectors and client commands passed fixture validation', function() {",
                   "  pm.expect(pm.response.code, pm.response.text()).to.equal(502);",
                   "  pm.expect(pm.response.json().error.message, pm.response.text()).to.include('invalid upstream SDP answer');",
@@ -247711,11 +247722,24 @@
                   "} else {",
                   "  removeProvider();",
                   "}"
+=======
+                  "// The profile declares mcp.tool_manager_config.oauth_private_allowlist; config.json loading must",
+                  "// persist it so the dashboard and the OAuth client both see it.",
+                  "pm.test('config read is a 200', function () {",
+                  "  pm.expect(pm.response.code, pm.response.text()).to.eql(200);",
+                  "});",
+                  "pm.test('allowlist from config.json is stored', function () {",
+                  "  var cc = pm.response.json().client_config || {};",
+                  "  pm.expect(cc.mcp_oauth_private_allowlist, pm.response.text()).to.be.an('array');",
+                  "  pm.expect(cc.mcp_oauth_private_allowlist).to.include.members(['localhost', '127.0.0.1']);",
+                  "});"
+>>>>>>> f9a2d8dfe (adds allow localhost oauth servers for mcp)
                 ]
               }
             }
           ],
           "request": {
+<<<<<<< HEAD
             "method": "POST",
             "header": [
               {
@@ -247768,10 +247792,37 @@
               }
             },
             {
+=======
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/config?from_db=true",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "config"
+              ],
+              "query": [
+                {
+                  "key": "from_db",
+                  "value": "true"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /api/mcp/client · OAuth MCP server on localhost returns an authorize URL",
+          "event": [
+            {
+>>>>>>> f9a2d8dfe (adds allow localhost oauth servers for mcp)
               "listen": "test",
               "script": {
                 "type": "text/javascript",
                 "exec": [
+<<<<<<< HEAD
                   "pm.test('Upstream accounting selectors and client commands passed fixture validation', function() {",
                   "  pm.expect(pm.response.code, pm.response.text()).to.equal(502);",
                   "  pm.expect(pm.response.json().error.message, pm.response.text()).to.include('invalid upstream SDP answer');",
@@ -247798,6 +247849,24 @@
                   "} else {",
                   "  removeProvider();",
                   "}"
+=======
+                  "// Before the allowlist existed this was a 500: 'OAuth discovery failed: ... blocked connection",
+                  "// to non-public address 127.0.0.1'. Discovery, dynamic client registration and the flow setup",
+                  "// must now reach the demo server on localhost.",
+                  "pm.test('registration starts the OAuth flow (200)', function () {",
+                  "  pm.expect(pm.response.code, pm.response.text()).to.eql(200);",
+                  "});",
+                  "pm.test('no SSRF refusal on the OAuth chain', function () {",
+                  "  pm.expect(pm.response.text()).to.not.include('blocked connection');",
+                  "});",
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) {}",
+                  "pm.test('pending_oauth with the demo server authorize URL', function () {",
+                  "  pm.expect(body.status, pm.response.text()).to.eql('pending_oauth');",
+                  "  pm.expect(String(body.authorize_url || ''), pm.response.text()).to.match(/^http:\\/\\/localhost:3003\\/authorize\\?/);",
+                  "  pm.expect(String(body.authorize_url || '')).to.include('code_challenge=');",
+                  "});"
+>>>>>>> f9a2d8dfe (adds allow localhost oauth servers for mcp)
                 ]
               }
             }
@@ -247808,14 +247877,18 @@
               {
                 "key": "Content-Type",
                 "value": "application/json"
+<<<<<<< HEAD
               },
               {
                 "key": "x-bf-vk",
                 "value": "{{liveFilterVK}}"
+=======
+>>>>>>> f9a2d8dfe (adds allow localhost oauth servers for mcp)
               }
             ],
             "body": {
               "mode": "raw",
+<<<<<<< HEAD
               "raw": "{\n  \"session\": {\n    \"model\": \"{{liveFilterProvider}}/gpt-live-1\",\n    \"instructions\": \"{{liveFilterInstructions}}\",\n    \"client\": {\"data_channel\":{\"allowed_client_events\":[\"session.close\"],\"allowed_server_events\":[{\"type\":\"session.started\"},{\"type\":\"session.closed\"},{\"type\":\"error\"}]}}\n  },\n  \"transport\": {\n    \"type\": \"webrtc\",\n    \"sdp\": \"v=0\\no=- 2520596364147198086 1791637009 IN IP4 0.0.0.0\\ns=-\\nt=0 0\\na=msid-semantic:WMS *\\na=fingerprint:sha-256 29:56:DD:98:22:7C:B2:1F:84:9E:BF:87:BF:52:4D:17:A3:AE:46:84:AA:B1:B8:E1:68:43:E9:9E:76:8F:9F:86\\na=extmap-allow-mixed\\na=group:BUNDLE 0 1\\nm=audio 9 UDP/TLS/RTP/SAVPF 111 9 0 8\\nc=IN IP4 0.0.0.0\\na=setup:actpass\\na=mid:0\\na=ice-ufrag:dKorrjfohEgxSdxV\\na=ice-pwd:YOalnasbQiXgKmYLBWgUdSTcaHKUGsNO\\na=rtcp-mux\\na=rtcp-rsize\\na=rtpmap:111 opus/48000/2\\na=fmtp:111 minptime=10;useinbandfec=1\\na=rtcp-fb:111 transport-cc\\na=rtpmap:9 G722/8000\\na=rtcp-fb:9 transport-cc\\na=rtpmap:0 PCMU/8000\\na=rtcp-fb:0 transport-cc\\na=rtpmap:8 PCMA/8000\\na=rtcp-fb:8 transport-cc\\na=extmap:4 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01\\na=ssrc:2776728827 cname:billing-fixture\\na=ssrc:2776728827 msid:billing-fixture audio\\na=ssrc:2776728827 mslabel:billing-fixture\\na=ssrc:2776728827 label:audio\\na=msid:billing-fixture audio\\na=sendrecv\\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\\nc=IN IP4 0.0.0.0\\na=setup:actpass\\na=mid:1\\na=sendrecv\\na=sctp-port:5000\\na=max-message-size:1073741823\\na=ice-ufrag:dKorrjfohEgxSdxV\\na=ice-pwd:YOalnasbQiXgKmYLBWgUdSTcaHKUGsNO\\n\"\n  }\n}"
             },
             "url": "{{baseUrl}}/openai/v1/live/sessions"
@@ -247993,6 +248066,21 @@
               "raw": "{\n  \"session\": {\n    \"model\": \"{{liveFilterProvider}}/gpt-live-1\",\n    \"instructions\": \"{{liveFilterInstructions}}\",\n    \"client\": {\"data_channel\":{\"allowed_client_events\":[\"session.close\"],\"allowed_server_events\":[{\"type\":\"response.event\",\"response_event\":\"response.output_text.delta\"}]}}\n  },\n  \"transport\": {\n    \"type\": \"webrtc\",\n    \"sdp\": \"v=0\\no=- 2520596364147198086 1791637009 IN IP4 0.0.0.0\\ns=-\\nt=0 0\\na=msid-semantic:WMS *\\na=fingerprint:sha-256 29:56:DD:98:22:7C:B2:1F:84:9E:BF:87:BF:52:4D:17:A3:AE:46:84:AA:B1:B8:E1:68:43:E9:9E:76:8F:9F:86\\na=extmap-allow-mixed\\na=group:BUNDLE 0 1\\nm=audio 9 UDP/TLS/RTP/SAVPF 111 9 0 8\\nc=IN IP4 0.0.0.0\\na=setup:actpass\\na=mid:0\\na=ice-ufrag:dKorrjfohEgxSdxV\\na=ice-pwd:YOalnasbQiXgKmYLBWgUdSTcaHKUGsNO\\na=rtcp-mux\\na=rtcp-rsize\\na=rtpmap:111 opus/48000/2\\na=fmtp:111 minptime=10;useinbandfec=1\\na=rtcp-fb:111 transport-cc\\na=rtpmap:9 G722/8000\\na=rtcp-fb:9 transport-cc\\na=rtpmap:0 PCMU/8000\\na=rtcp-fb:0 transport-cc\\na=rtpmap:8 PCMA/8000\\na=rtcp-fb:8 transport-cc\\na=extmap:4 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01\\na=ssrc:2776728827 cname:billing-fixture\\na=ssrc:2776728827 msid:billing-fixture audio\\na=ssrc:2776728827 mslabel:billing-fixture\\na=ssrc:2776728827 label:audio\\na=msid:billing-fixture audio\\na=sendrecv\\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\\nc=IN IP4 0.0.0.0\\na=setup:actpass\\na=mid:1\\na=sendrecv\\na=sctp-port:5000\\na=max-message-size:1073741823\\na=ice-ufrag:dKorrjfohEgxSdxV\\na=ice-pwd:YOalnasbQiXgKmYLBWgUdSTcaHKUGsNO\\n\"\n  }\n}"
             },
             "url": "{{baseUrl}}/v1/live/sessions"
+=======
+              "raw": "{\n  \"name\": \"harness_oauth_loopback_{{$timestamp}}\",\n  \"connection_type\": \"http\",\n  \"connection_string\": \"http://localhost:3003/mcp\",\n  \"auth_type\": \"oauth\",\n  \"oauth_config\": {}\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/mcp/client",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "mcp",
+                "client"
+              ]
+            }
+>>>>>>> f9a2d8dfe (adds allow localhost oauth servers for mcp)
           }
         }
       ]
