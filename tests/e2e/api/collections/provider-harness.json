@@ -249847,6 +249847,115 @@
           "response": []
         }
       ]
+    },
+    {
+      "name": "205. Vertex key credential changes require dashboard auth (key-credential-dial-targets) [SERIAL]",
+      "description": "Management-plane regression for the default harness profile (tests/integrations/python/config.json, dashboard auth unconfigured). A caller admitted without a credential check creates a Vertex key whose auth_credentials JSON is an external-account document naming its own token_url and a credential_source file: the Google client would read that file and post it to that host on the key's first use. The request is refused with 403 naming vertex_key_config.auth_credentials, and no key of that name exists afterwards. No provider call is made; the vertex keyword is only the route and the harness filter label. Red before the change: the key was created, since only URL-typed key fields were compared. Under a profile with dashboard auth enabled the first row returns 401 and fails loudly on purpose - run it against the default profile.",
+      "item": [
+        {
+          "name": "[EXPECT-403] vertex key-credential-dial-targets: a key whose credential JSON names its own token and credential-source URLs is refused without dashboard auth",
+          "protocolProfileBehavior": {
+            "followRedirects": false,
+            "disableCookies": true
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "// The credential JSON is where the Google client dials with this key, so under the fail-open",
+                  "// bypass it is held to the same rule as an Azure endpoint: 403 naming the field, never a 200",
+                  "// that would mean an unauthenticated caller chose where the key's credential goes.",
+                  "pm.test('key-credential-dial-targets: vertex key with a credential JSON is refused with 403', function () {",
+                  "  pm.expect(pm.response.code, 'failed: ' + txt.slice(0, 400)).to.equal(403);",
+                  "});",
+                  "pm.test('key-credential-dial-targets: the refusal names vertex_key_config.auth_credentials and the missing admin session', function () {",
+                  "  pm.expect(txt, 'failed: ' + txt.slice(0, 400)).to.include('vertex_key_config.auth_credentials');",
+                  "  pm.expect(txt, 'failed: ' + txt.slice(0, 400)).to.include('authenticated admin session');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/providers/vertex/keys",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "providers",
+                "vertex",
+                "keys"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"harness-credential-guard\",\n  \"weight\": 1,\n  \"vertex_key_config\": {\n    \"project_id\": \"harness-project\",\n    \"region\": \"us-central1\",\n    \"auth_credentials\": \"{\\\"type\\\":\\\"external_account\\\",\\\"audience\\\":\\\"//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/harness/providers/harness\\\",\\\"subject_token_type\\\":\\\"urn:ietf:params:oauth:token-type:jwt\\\",\\\"token_url\\\":\\\"https://harness-credential-guard.example.invalid/token\\\",\\\"credential_source\\\":{\\\"file\\\":\\\"/etc/hostname\\\"}}\"\n  }\n}"
+            }
+          }
+        },
+        {
+          "name": "[EXPECT-200] vertex key-credential-dial-targets: the refused key was not persisted",
+          "protocolProfileBehavior": {
+            "followRedirects": false,
+            "disableCookies": true
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "pm.test('key-credential-dial-targets: key list is readable', function () {",
+                  "  pm.expect(pm.response.code, 'failed: ' + txt.slice(0, 400)).to.equal(200);",
+                  "});",
+                  "var j = {};",
+                  "try { j = pm.response.json() || {}; } catch (e) { j = {}; }",
+                  "var keys = Array.isArray(j) ? j : (j.keys || []);",
+                  "var leaked = keys.filter(function (k) { return k && k.name === 'harness-credential-guard'; });",
+                  "pm.test('key-credential-dial-targets: no key named harness-credential-guard exists after the refusal', function () {",
+                  "  pm.expect(leaked.length, 'failed: ' + txt.slice(0, 400)).to.equal(0);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/providers/vertex/keys",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "providers",
+                "vertex",
+                "keys"
+              ]
+            }
+          }
+        }
+      ]
     }
   ]
 }
