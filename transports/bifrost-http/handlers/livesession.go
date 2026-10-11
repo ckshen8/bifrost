@@ -14,6 +14,7 @@ import (
 	bifrost "github.com/maximhq/bifrost/core"
 	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/plugins/governance"
 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
 	"github.com/valyala/fasthttp"
@@ -119,7 +120,64 @@ func (g *liveGateway) resolveSession(ctx *fasthttp.RequestCtx, req *liveRequest)
 	if g.config.ClientConfig.EnforceAuthOnInference && !governance.PresentedCredentialResolved(req.preReqCtx) {
 		return refuse(newRealtimeWireBifrostError(401, "invalid_request_error", realtimeUnresolvedCredentialMessage))
 	}
+	if bifrostErr := g.checkLiveSessionOwner(req.preReqCtx, providerKey, req.sessionID); bifrostErr != nil {
+		return refuse(bifrostErr)
+	}
 	return true
+}
+
+// A live session is opened on the operator's provider key, which every virtual key allowed on
+// the provider shares, and is afterwards addressed by the provider's session id alone. The two
+// functions below make it belong to the virtual key that opened it, the way governance binds
+// batches and files: the id is recorded under that key as soon as the provider names it, and a
+// route on the session from another virtual key is refused as not found before a key is
+// selected or anything is dialed. The rule is the same narrow one: a caller with no virtual key
+// is unrestricted, and a session nobody recorded (opened before this binding existed, or with no
+// virtual key) stays reachable.
+
+// bindLiveSession records the virtual key that opened the provider session, if any. A record
+// that cannot be written is logged: the session itself has already been admitted and billed.
+func (g *liveGateway) bindLiveSession(ctx *schemas.BifrostContext, providerKey schemas.ModelProvider, providerSessionID string) {
+	vkID := bifrost.GetStringFromContext(ctx, schemas.BifrostContextKeyGovernanceVirtualKeyID)
+	if vkID == "" || g.config == nil || g.config.ConfigStore == nil {
+		return
+	}
+	object := &tables.TableProviderObject{
+		ID:           tables.ProviderObjectID(tables.ProviderObjectKindLiveSession, string(providerKey), providerSessionID),
+		Kind:         tables.ProviderObjectKindLiveSession,
+		Provider:     string(providerKey),
+		ObjectID:     providerSessionID,
+		VirtualKeyID: vkID,
+	}
+	if err := g.config.ConfigStore.UpsertProviderObject(ctx, object); err != nil {
+		logger.Warn("live session %s: failed to record the virtual key that opened it: %v", providerSessionID, err)
+	}
+}
+
+// checkLiveSessionOwner refuses a route on a session that another virtual key opened. Without a
+// config store nothing is recorded anywhere, so a virtual-key request cannot be checked and is
+// refused, as governance refuses bound provider objects; a store failure is refused too rather
+// than let an unverified request through.
+func (g *liveGateway) checkLiveSessionOwner(ctx *schemas.BifrostContext, providerKey schemas.ModelProvider, sessionID string) *schemas.BifrostError {
+	vkID := bifrost.GetStringFromContext(ctx, schemas.BifrostContextKeyGovernanceVirtualKeyID)
+	if vkID == "" {
+		return nil
+	}
+	if g.config == nil || g.config.ConfigStore == nil {
+		return newRealtimeWireBifrostError(403, "invalid_request_error", "live session access cannot be verified for virtual keys without a config store")
+	}
+	id := tables.ProviderObjectID(tables.ProviderObjectKindLiveSession, string(providerKey), sessionID)
+	objects, err := g.config.ConfigStore.GetProviderObjectsByIDs(ctx, []string{id})
+	if err != nil {
+		logger.Error("live session %s: failed to load its virtual key for the ownership check: %v", sessionID, err)
+		return newRealtimeWireBifrostError(500, "server_error", "failed to verify access to the live session")
+	}
+	for _, object := range objects {
+		if object != nil && object.VirtualKeyID != "" && object.VirtualKeyID != vkID {
+			return newRealtimeWireBifrostError(404, "invalid_request_error", "live session not found")
+		}
+	}
+	return nil
 }
 
 // resolveTarget runs the pre-request pipeline (credential resolution, routing) and resolves the
@@ -156,6 +214,7 @@ func (g *liveGateway) resolveTarget(preReqCtx *schemas.BifrostContext, path stri
 func (g *liveGateway) admit(auth *authHeaders, preReqCtx *schemas.BifrostContext, middlewareValues map[any]any, path string, target liveTarget, sessionID string) (*liveAdmission, *schemas.BifrostError) {
 	ctx, cancel := g.sessionContext(auth, preReqCtx, middlewareValues, path)
 	meter := newLiveMeter(g.client, ctx, target.providerKey, schemas.Key{}, sessionID)
+	meter.bind = func(providerSessionID string) { g.bindLiveSession(ctx, target.providerKey, providerSessionID) }
 	if bifrostErr := meter.admit(target.voiceModel, target.backendModel); bifrostErr != nil {
 		cancel()
 		return nil, bifrostErr
@@ -220,9 +279,9 @@ func (g *liveGateway) controlProvider(path string) (schemas.LiveProvider, schema
 	return provider, providerKey, nil
 }
 
-// controlKey selects the key a route on an existing session acts with. Sessions are not yet
-// bound to the key that opened them, so this is ordinary selection: the caller's pinned key, or
-// any key for the provider; the provider refuses a key that does not own the session.
+// controlKey selects the key a route on an existing session acts with. The session's virtual
+// key was checked by resolveSession; the provider key is ordinary selection, the caller's pinned
+// key or any key for the provider, and the provider refuses a key that does not own the session.
 func (g *liveGateway) controlKey(ctx *schemas.BifrostContext, providerKey schemas.ModelProvider) (schemas.Key, *schemas.BifrostError) {
 	key, err := g.client.SelectKeyForProviderRequestType(ctx, schemas.LiveRequest, providerKey, "")
 	if err != nil {

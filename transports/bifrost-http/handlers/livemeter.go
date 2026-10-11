@@ -71,7 +71,8 @@ type liveMeter struct {
 	key      schemas.Key
 	window   float64
 
-	sessionID string // Bifrost's id: every unit groups under it, from admission on
+	sessionID string          // Bifrost's id: every unit groups under it, from admission on
+	bind      func(id string) // called once with OpenAI's id, before any client learns it
 
 	mu                sync.Mutex
 	providerSessionID string // OpenAI's id, known from session.started
@@ -185,14 +186,22 @@ func (m *liveMeter) abort(bifrostErr *schemas.BifrostError) {
 	}
 }
 
-// setProviderSessionID records OpenAI's session id once session.started names it.
+// setProviderSessionID records OpenAI's session id once session.started (or the WebRTC create
+// response) names it, and binds the session to its opener through bind. Both callers run before
+// the id is handed to the client, so the binding exists by the time anyone can address the
+// session by it.
 func (m *liveMeter) setProviderSessionID(id string) {
 	if id = strings.TrimSpace(id); id == "" {
 		return
 	}
 	m.mu.Lock()
+	first := m.providerSessionID == ""
 	m.providerSessionID = id
+	bind := m.bind
 	m.mu.Unlock()
+	if first && bind != nil {
+		bind(id)
+	}
 }
 
 // onUsage records a cumulative session.usage.updated snapshot and bills a full window.
