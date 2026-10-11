@@ -1913,6 +1913,7 @@ func mergeProviderKeys(provider schemas.ModelProvider, fileKeys, dbKeys []schema
 					SGLKeyConfig:           dbKey.SGLKeyConfig,
 					DatabricksKeyConfig:    dbKey.DatabricksKeyConfig,
 					GithubCopilotKeyConfig: dbKey.GithubCopilotKeyConfig,
+					CloudflareKeyConfig:    dbKey.CloudflareKeyConfig,
 					Enabled:                dbKey.Enabled,
 					UseForBatchAPI:         dbKey.UseForBatchAPI,
 					UseAnthropicEndpoints:  dbKey.UseAnthropicEndpoints,
@@ -1998,6 +1999,7 @@ func reconcileProviderKeys(provider schemas.ModelProvider, fileKeys, dbKeys []sc
 					SGLKeyConfig:           dbKey.SGLKeyConfig,
 					DatabricksKeyConfig:    dbKey.DatabricksKeyConfig,
 					GithubCopilotKeyConfig: dbKey.GithubCopilotKeyConfig,
+					CloudflareKeyConfig:    dbKey.CloudflareKeyConfig,
 					Enabled:                dbKey.Enabled,
 					UseForBatchAPI:         dbKey.UseForBatchAPI,
 					UseAnthropicEndpoints:  dbKey.UseAnthropicEndpoints,
@@ -7994,6 +7996,12 @@ func (c *Config) GetAllKeys() ([]configstoreTables.TableKey, error) {
 				cfg.PrivateKey = *cfg.PrivateKey.Redacted()
 				cfg.GithubDomain = *cfg.GithubDomain.Redacted()
 				configStoreKey.GithubCopilotKeyConfig = &cfg
+			}
+			if key.CloudflareKeyConfig != nil {
+				cfg := *key.CloudflareKeyConfig // safe copy
+				// The account ID is an identifier, not a credential — surface it in plaintext.
+				cfg.AccountID = *cfg.AccountID.RedactedIfSecret()
+				configStoreKey.CloudflareKeyConfig = &cfg
 			}
 			keys = append(keys, configStoreKey)
 		}
