@@ -250054,6 +250054,207 @@
           "response": []
         }
       ]
+    },
+    {
+      "name": "207. Built-in plugin endpoints and secret references require dashboard auth (plugin-config-dial-targets) [SERIAL]",
+      "description": "Management-plane regression for the default harness profile (tests/integrations/python/config.json, dashboard auth unconfigured). A caller admitted without a credential check updates the built-in otel plugin with a collector URL and a header whose value is an env. reference: the plugin would resolve that reference from the gateway's own environment and post it to that collector on every trace export. The request is refused with 403 naming collector_url, the header path and the missing admin session, and a read afterwards shows none of it stored. The update handler creates an empty row for an unknown plugin before reading the body, so the folder notes whether otel existed and deletes the empty row it created. No provider call is made; the openai keyword is only the harness filter label. Red before the change: the update was 200 and the config was stored and reloaded. Under a profile with dashboard auth enabled the update returns 401 and fails loudly on purpose - run it against the default profile.",
+      "item": [
+        {
+          "name": "openai plugin-config-dial-targets setup: note whether the otel plugin row exists",
+          "protocolProfileBehavior": {
+            "followRedirects": false,
+            "disableCookies": true
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "// The update handler creates an empty row for an unknown plugin before it reads the body, so",
+                  "// remember whether otel existed to know whether the cleanup at the end should delete it.",
+                  "pm.test('plugin-config-dial-targets: the plugin read answers 200 or 404', function () {",
+                  "  pm.expect([200, 404], 'failed: ' + txt.slice(0, 400)).to.include(pm.response.code);",
+                  "});",
+                  "pm.collectionVariables.set('pcdtOtelExisted', pm.response.code === 200 ? 'yes' : 'no');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/otel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "plugins",
+                "otel"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "[EXPECT-403] openai plugin-config-dial-targets: an otel config naming a collector and an env header is refused without dashboard auth",
+          "protocolProfileBehavior": {
+            "followRedirects": false,
+            "disableCookies": true
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "// The collector is where every trace export goes and the env. header is what goes with it,",
+                  "// resolved from the gateway's own environment. Under the fail-open bypass both must be refused",
+                  "// with 403 naming the fields, never a 200 that would mean the config was stored and reloaded.",
+                  "pm.test('plugin-config-dial-targets: otel update with a collector and an env header is refused with 403', function () {",
+                  "  pm.expect(pm.response.code, 'failed: ' + txt.slice(0, 400)).to.equal(403);",
+                  "});",
+                  "pm.test('plugin-config-dial-targets: the refusal names the collector, the env header and the missing admin session', function () {",
+                  "  pm.expect(txt, 'failed: ' + txt.slice(0, 400)).to.include('collector_url');",
+                  "  pm.expect(txt, 'failed: ' + txt.slice(0, 400)).to.include('headers.x-harness-leak');",
+                  "  pm.expect(txt, 'failed: ' + txt.slice(0, 400)).to.include('authenticated admin session');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/otel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "plugins",
+                "otel"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"enabled\": false,\n  \"config\": {\n    \"service_name\": \"harness-plugin-guard\",\n    \"collector_url\": \"https://harness-plugin-guard.example.invalid/v1/traces\",\n    \"headers\": {\n      \"x-harness-leak\": \"env.HARNESS_PLUGIN_GUARD_MARKER\"\n    }\n  }\n}"
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "openai plugin-config-dial-targets: the refused collector and header were not stored",
+          "protocolProfileBehavior": {
+            "followRedirects": false,
+            "disableCookies": true
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "pm.test('plugin-config-dial-targets: the plugin read answers 200 or 404', function () {",
+                  "  pm.expect([200, 404], 'failed: ' + txt.slice(0, 400)).to.include(pm.response.code);",
+                  "});",
+                  "pm.test('plugin-config-dial-targets: no trace of the refused config is stored', function () {",
+                  "  pm.expect(txt, 'collector stored: ' + txt.slice(0, 400)).to.not.include('https://harness-plugin-guard.example.invalid/v1/traces');",
+                  "  pm.expect(txt, 'env header stored: ' + txt.slice(0, 400)).to.not.include('HARNESS_PLUGIN_GUARD_MARKER');",
+                  "  pm.expect(txt, 'service name stored: ' + txt.slice(0, 400)).to.not.include('harness-plugin-guard');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/otel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "plugins",
+                "otel"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "openai plugin-config-dial-targets cleanup: delete the empty otel row the refused update may have created",
+          "protocolProfileBehavior": {
+            "followRedirects": false,
+            "disableCookies": true
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.collectionVariables.get('pcdtOtelExisted') !== 'no') { pm.execution.skipRequest(); return; }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "pm.test('plugin-config-dial-targets: the empty otel row is removed', function () {",
+                  "  pm.expect([200, 404], 'failed: ' + txt.slice(0, 400)).to.include(pm.response.code);",
+                  "});",
+                  "pm.collectionVariables.unset('pcdtOtelExisted');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/otel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "plugins",
+                "otel"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
     }
   ]
 }

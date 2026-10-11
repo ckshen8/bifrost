@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -187,6 +188,96 @@ func TestUpdatePlugin_RejectsCustomPathWhenAuthBypassed(t *testing.T) {
 	}
 	if store.capturedConfig != nil || store.capturedEnabled {
 		t.Error("UpdatePlugin should not have been called on the config store")
+	}
+}
+
+// TestPluginConfigDialTargetsRequireGenuineAuth pins that a caller admitted without a credential
+// check cannot make a built-in plugin send the gateway's secrets anywhere: an env./vault.
+// reference anywhere in the config, or an outbound endpoint (the OTEL collector and metrics
+// endpoints, the telemetry push gateway), may be set or changed only by a genuinely authenticated
+// request. Values identical to the stored config, removals and other fields still pass, so a
+// bypassed caller can toggle a plugin or edit it without moving its destination.
+func TestPluginConfigDialTargetsRequireGenuineAuth(t *testing.T) {
+	SetLogger(&mockLogger{})
+
+	const collector = "https://otel.internal:4318"
+	const realAuth = "Basic-REAL-SUPER-SECRET-VALUE"
+	maskedAuth := schemas.NewSecretVar(realAuth).Redacted().GetValue()
+	otelStored := map[string]any{"service_name": "bifrost", "collector_url": collector, "headers": map[string]any{"Authorization": realAuth}}
+	telemetryStored := map[string]any{"custom_labels": []any{"team"}}
+
+	cases := []struct {
+		name      string
+		plugin    string
+		create    bool
+		genuine   bool // a real credential, not the fail-open bypass
+		stored    map[string]any
+		config    map[string]any
+		want      int
+		wantNamed string
+	}{
+		{name: "create otel with a collector", plugin: "otel", create: true, config: map[string]any{"collector_url": collector}, want: fasthttp.StatusForbidden, wantNamed: "collector_url"},
+		{name: "move the collector", plugin: "otel", stored: otelStored, config: map[string]any{"collector_url": "https://evil.example/v1/traces"}, want: fasthttp.StatusForbidden, wantNamed: "collector_url"},
+		{name: "set a metrics endpoint", plugin: "otel", stored: otelStored, config: map[string]any{"metrics_enabled": true, "metrics_endpoint": "https://evil.example/v1/metrics"}, want: fasthttp.StatusForbidden, wantNamed: "metrics_endpoint"},
+		{name: "add an env header", plugin: "otel", stored: otelStored, config: map[string]any{"headers": map[string]any{"Authorization": realAuth, "x-leak": "env.OPENAI_API_KEY"}}, want: fasthttp.StatusForbidden, wantNamed: "headers.x-leak"},
+		{name: "add a vault header", plugin: "otel", stored: otelStored, config: map[string]any{"trace_headers": map[string]any{"x-leak": "vault.secret/data/openai#key"}}, want: fasthttp.StatusForbidden, wantNamed: "trace_headers.x-leak"},
+		{name: "move the collector inside a profile", plugin: "otel", stored: otelStored, config: map[string]any{"profiles": []any{map[string]any{"service_name": "x", "collector_url": "https://evil.example"}}}, want: fasthttp.StatusForbidden, wantNamed: "profiles[0].collector_url"},
+		{name: "set the push gateway", plugin: "telemetry", stored: telemetryStored, config: map[string]any{"push_gateway": map[string]any{"enabled": true, "push_gateway_url": "https://evil.example:9091"}}, want: fasthttp.StatusForbidden, wantNamed: "push_gateway.push_gateway_url"},
+		{name: "set an env basic-auth password", plugin: "telemetry", stored: telemetryStored, config: map[string]any{"push_gateway": map[string]any{"basic_auth": map[string]any{"username": "bifrost", "password": "env.PG_PASSWORD"}}}, want: fasthttp.StatusForbidden, wantNamed: "push_gateway.basic_auth.password"},
+		{name: "same collector echoed back", plugin: "otel", stored: otelStored, config: map[string]any{"service_name": "renamed", "collector_url": collector}, want: fasthttp.StatusOK},
+		{name: "masked header echoed back", plugin: "otel", stored: otelStored, config: map[string]any{"collector_url": collector, "headers": map[string]any{"Authorization": maskedAuth}}, want: fasthttp.StatusOK},
+		{name: "collector removed", plugin: "otel", stored: otelStored, config: map[string]any{"collector_url": ""}, want: fasthttp.StatusOK},
+		{name: "genuinely authenticated collector move", plugin: "otel", genuine: true, stored: otelStored, config: map[string]any{"collector_url": "https://otel.other.internal:4318"}, want: fasthttp.StatusOK},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &capturePluginsStore{}
+			if tc.stored != nil {
+				store.existingPlugin = &configstoreTables.TablePlugin{Name: tc.plugin, Enabled: true, Config: tc.stored}
+			}
+			h := &PluginsHandler{pluginsLoader: noopPluginsLoader{}, configStore: store}
+			body := map[string]any{"enabled": true, "config": tc.config}
+			var ctx *fasthttp.RequestCtx
+			if tc.create {
+				body["name"] = tc.plugin
+				ctx = buildCreateRequest(t, body)
+			} else {
+				ctx = buildUpdateRequest(t, body)
+				ctx.SetUserValue("name", tc.plugin)
+			}
+			if !tc.genuine {
+				ctx.SetUserValue(schemas.BifrostContextKeyAuthBypassed, true)
+			}
+			if tc.create {
+				h.createPlugin(ctx)
+			} else {
+				h.updatePlugin(ctx)
+			}
+
+			got := ctx.Response.StatusCode()
+			if tc.want == fasthttp.StatusOK && tc.create {
+				tc.want = fasthttp.StatusCreated
+			}
+			if got != tc.want {
+				t.Fatalf("status got %d, want %d; body=%s", got, tc.want, ctx.Response.Body())
+			}
+			if tc.want == fasthttp.StatusForbidden {
+				if tc.wantNamed != "" && !bytes.Contains(ctx.Response.Body(), []byte(tc.wantNamed)) {
+					t.Fatalf("the refusal must name %s, got %s", tc.wantNamed, ctx.Response.Body())
+				}
+				if tc.create && store.existingPlugin != nil {
+					t.Fatal("a refused create must not reach the config store")
+				}
+				if !tc.create && store.capturedConfig != nil {
+					t.Fatalf("a refused update must not reach the config store, stored %v", store.capturedConfig)
+				}
+				return
+			}
+			if !tc.create && store.capturedConfig == nil {
+				t.Fatal("an admitted update must reach the config store")
+			}
+		})
 	}
 }
 

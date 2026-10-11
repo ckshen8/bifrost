@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
+	"strings"
 	"sync"
 
 	"github.com/fasthttp/router"
@@ -355,6 +357,9 @@ func (h *PluginsHandler) createPlugin(ctx *fasthttp.RequestCtx) {
 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid plugin configuration: %v", err))
 		return
 	}
+	if requireGenuineAuthForPluginConfigChange(ctx, nil, normalizedConfig) {
+		return
+	}
 	// Create DB entry first to avoid orphaned in-memory state if DB write fails
 	if err := h.configStore.CreatePlugin(ctx, &configstoreTables.TablePlugin{
 		Name:      request.Name,
@@ -506,6 +511,13 @@ func (h *PluginsHandler) updatePlugin(ctx *fasthttp.RequestCtx) {
 		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid plugin configuration: %v", err))
 		return
 	}
+	var storedConfig map[string]any
+	if existingPlugin != nil {
+		storedConfig, _ = existingPlugin.Config.(map[string]any)
+	}
+	if requireGenuineAuthForPluginConfigChange(ctx, storedConfig, mergedConfig) {
+		return
+	}
 	// Updating the plugin
 	if err := h.configStore.UpdatePlugin(ctx, &configstoreTables.TablePlugin{
 		Name:      name,
@@ -637,6 +649,88 @@ func (h *PluginsHandler) deletePlugin(ctx *fasthttp.RequestCtx) {
 	SendJSON(ctx, map[string]interface{}{
 		"message": "Plugin deleted successfully",
 	})
+}
+
+// pluginEndpointKeys are plugin config keys whose string value is a host the plugin dials with
+// what the rest of its config tells it to send: the OTEL collector and metrics endpoints, the
+// telemetry push gateway, and the generic names a future plugin is likely to use.
+var pluginEndpointKeys = map[string]bool{
+	"collector_url":    true,
+	"metrics_endpoint": true,
+	"push_gateway_url": true,
+	"endpoint":         true,
+	"url":              true,
+	"base_url":         true,
+}
+
+// isSecretReference reports an env. or vault. reference by its prefix alone. The value is never
+// handed to NewSecretVar here, which would resolve it from the gateway's environment or vault.
+func isSecretReference(value string) bool {
+	return strings.HasPrefix(value, "env.") || strings.HasPrefix(value, "vault.")
+}
+
+// pluginConfigDialTargets flattens a normalized plugin config into the values that decide where
+// the plugin sends data and what it sends: every env./vault. reference at any depth, keyed by its
+// path, and every non-empty string under a pluginEndpointKeys key. Normalization has already
+// turned SecretVar objects into plain strings, so a reference is a string that starts with its
+// prefix wherever it sits.
+func pluginConfigDialTargets(prefix string, value any, out map[string]string) {
+	switch v := value.(type) {
+	case map[string]any:
+		for key, item := range v {
+			path := key
+			if prefix != "" {
+				path = prefix + "." + key
+			}
+			if s, ok := item.(string); ok && pluginEndpointKeys[key] && s != "" {
+				out[path] = s
+				continue
+			}
+			pluginConfigDialTargets(path, item, out)
+		}
+	case []any:
+		for i, item := range v {
+			pluginConfigDialTargets(fmt.Sprintf("%s[%d]", prefix, i), item, out)
+		}
+	case string:
+		if isSecretReference(v) {
+			out[prefix] = v
+		}
+	}
+}
+
+// requireGenuineAuthForPluginConfigChange refuses a built-in plugin create or update that adds
+// or changes an outbound endpoint or an env./vault. reference when the caller was only let
+// through by the fail-open bypass (dashboard auth disabled, unconfigured, or a whitelisted
+// route), not by a real credential. A plugin's config names where the gateway sends data and
+// what it sends: the OTEL plugin resolves env. references in its headers from the gateway's own
+// process environment and posts them to the collector on every export, and the telemetry plugin
+// does the same for its push gateway and basic auth, so a caller with no credential check must
+// not be able to read the gateway's secrets by naming them, nor redirect exports. This is the
+// plugins counterpart of the MCP, provider, provider-key and webhook gates. stored is the
+// persisted normalized config on update and nil on create; a value identical to the stored one
+// passes, as does removing one, so bypassed callers can still toggle a plugin or edit its other
+// fields. Config.json provisioning is not gated. On rejection the response has been sent and
+// true is returned; callers should return immediately.
+func requireGenuineAuthForPluginConfigChange(ctx *fasthttp.RequestCtx, stored, next map[string]any) bool {
+	if !isAuthBypassed(ctx) {
+		return false
+	}
+	before, after := map[string]string{}, map[string]string{}
+	pluginConfigDialTargets("", stored, before)
+	pluginConfigDialTargets("", next, after)
+	var changed []string
+	for path, value := range after {
+		if before[path] != value {
+			changed = append(changed, path)
+		}
+	}
+	if len(changed) == 0 {
+		return false
+	}
+	slices.Sort(changed)
+	SendError(ctx, fasthttp.StatusForbidden, fmt.Sprintf("Setting a plugin's endpoints or env./vault. references (%s) requires an authenticated admin session; dashboard auth is currently disabled or unconfigured. Enable dashboard authentication, or provision the plugin via config.json instead.", strings.Join(changed, ", ")))
+	return true
 }
 
 // restoreRedactedFromExisting walks the incoming config map and, for any field whose
